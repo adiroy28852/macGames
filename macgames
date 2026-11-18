@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# macgames — run Windows games on Apple Silicon (Rosetta 2 + Wine + DirectX→Metal).
+# Proof of concept. See README.md.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIME="$ROOT/runtime"
+BOTTLES="$ROOT/bottles"
+COMPAT="$ROOT/compat"
+DL="$RUNTIME/downloads"
+
+# Pinned runtime versions.
+WINE_VER="11.21"
+WINE_URL="https://github.com/Gcenx/macOS_Wine_builds/releases/download/$WINE_VER/wine-staging-$WINE_VER-osx64.tar.xz"
+DXMT_VER="v0.80"
+DXMT_URL="https://github.com/3Shain/dxmt/releases/download/$DXMT_VER/dxmt-$DXMT_VER-builtin.tar.gz"
+GPTK_VER="3.0-3"
+GPTK_URL="https://github.com/Gcenx/game-porting-toolkit/releases/download/Game-Porting-Toolkit-$GPTK_VER/game-porting-toolkit-$GPTK_VER.tar.xz"
+STEAM_URL="https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe"
+
+STEAM_EXE='C:\Program Files (x86)\Steam\steam.exe'
+
+die()  { echo "error: $*" >&2; exit 1; }
+info() { echo "==> $*" >&2; }
+
+# ---------------------------------------------------------------- runtimes
+
+# Each backend maps to a Wine build:
+#   wined3d  — stock Wine (DirectX → OpenGL)
+#   dxmt     — stock Wine with DXMT builtins (D3D10/11 → Metal)
+#   d3dmetal — Apple Game Porting Toolkit Wine (D3D11/12 → Metal)
+wine_bin_dir() {
+  case "$1" in
+    wined3d)  echo "$RUNTIME/wine/Wine Staging.app/Contents/Resources/wine/bin" ;;
+    dxmt)     echo "$RUNTIME/wine-dxmt/Wine Staging.app/Contents/Resources/wine/bin" ;;
+    d3dmetal) echo "$RUNTIME/gptk/Game Porting Toolkit.app/Contents/Resources/wine/bin" ;;
+    *) die "unknown backend '$1' (wined3d|dxmt|d3dmetal)" ;;
+  esac
+}
+
+wine_exe() { # backend -> path to wine launcher (GPTK ships it as wine64)
+  local bin; bin="$(wine_bin_dir "$1")"
+  if [[ -x "$bin/wine" ]]; then echo "$bin/wine"; else echo "$bin/wine64"; fi
+}
+
+# Note: bottles made by one Wine build must not be opened by another, so the
+# backend is fixed when a bottle is created and never changed afterwards.
+
+fetch() { # url
+  local f="$DL/$(basename "$1")"
+  [[ -f "$f" ]] || { info "downloading $(basename "$1")"; curl -fL --progress-bar -o "$f.part" "$1" && mv "$f.part" "$f"; }
+  echo "$f"
+}
+
+cmd_setup() {
+  [[ "$(uname -m)" == arm64 ]] || die "this tool targets Apple Silicon"
+  if ! /usr/bin/pgrep -q oahd; then
+    info "installing Rosetta 2"
+    softwareupdate --install-rosetta --agree-to-license
+  fi
+  mkdir -p "$DL" "$BOTTLES"
+
+  if [[ ! -d "$RUNTIME/wine" ]]; then
+    local f; f="$(fetch "$WINE_URL")"
+    mkdir -p "$RUNTIME/wine" && tar -xf "$f" -C "$RUNTIME/wine"
+  fi
+
+  if [[ ! -d "$RUNTIME/wine-dxmt" ]]; then
+    local f; f="$(fetch "$DXMT_URL")"
+    mkdir -p "$RUNTIME/dxmt" && tar -xzf "$f" -C "$RUNTIME/dxmt"
+    info "building DXMT Wine variant (APFS clone, ~0 extra disk)"
+    cp -Rc "$RUNTIME/wine" "$RUNTIME/wine-dxmt"
+    local lib="$RUNTIME/wine-dxmt/Wine Staging.app/Contents/Resources/wine/lib/wine"
+    local src="$RUNTIME/dxmt/$DXMT_VER"
+    cp "$src"/x86_64-unix/*    "$lib/x86_64-unix/"
+    cp "$src"/x86_64-windows/* "$lib/x86_64-windows/"
+    cp "$src"/i386-windows/*   "$lib/i386-windows/"
+  fi
+
+  if [[ ! -d "$RUNTIME/gptk" ]]; then
+    local f; f="$(fetch "$GPTK_URL")"
+    mkdir -p "$RUNTIME/gptk" && tar -xf "$f" -C "$RUNTIME/gptk"
+  fi
+
+  xattr -dr com.apple.quarantine "$RUNTIME" 2>/dev/null || true
+  info "runtimes ready: wine-staging $WINE_VER, dxmt $DXMT_VER, gptk $GPTK_VER"
+}
+
+# ---------------------------------------------------------------- bottles
+
+bottle_dir() { echo "$BOTTLES/$1"; }
+
+load_bottle() { # name -> sets BACKEND, WINEPREFIX
+  local dir; dir="$(bottle_dir "$1")"
+  [[ -f "$dir/bottle.conf" ]] || die "no bottle '$1' (create it with: macgames create $1)"
+  BACKEND=""; # shellcheck disable=SC1091
+  source "$dir/bottle.conf"
+  export WINEPREFIX="$dir/prefix"
+}
+
+# Run a Wine command in a bottle. Backend may be overridden within the same family.
+wine_in() { # bottle backend cmd...
+  local bottle="$1" backend="$2"; shift 2
+  local wine; wine="$(wine_exe "$backend")"
+  [[ -x "$wine" ]] || die "runtime for '$backend' missing — run: macgames setup"
+  export WINEDEBUG="${WINEDEBUG:--all}"
+  export WINEESYNC=1 WINEMSYNC=1
+  [[ "${HUD:-0}" == 1 ]] && export MTL_HUD_ENABLED=1
+  case "$backend" in
+    d3dmetal) export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}dxgi,d3d9,d3d10core,d3d11,d3d12=b" ;;
+  esac
+  local log="$(bottle_dir "$bottle")/last-run.log"
+  "$wine" "$@" 2>&1 | tee "$log"
+}
+
+cmd_create() { # name [backend]
+  local name="${1:?usage: macgames create <name> [wined3d|dxmt|d3dmetal]}" backend="${2:-dxmt}"
+  wine_bin_dir "$backend" >/dev/null
+  local dir; dir="$(bottle_dir "$name")"
+  [[ -e "$dir" ]] && die "bottle '$name' already exists"
+  mkdir -p "$dir/prefix"
+  echo "BACKEND=$backend" > "$dir/bottle.conf"
+  export WINEPREFIX="$dir/prefix"
+  info "initialising bottle '$name' ($backend)"
+  WINEDEBUG=-all "$(wine_exe "$backend")" wineboot --init >/dev/null 2>&1
+  # Windows 10 reporting keeps modern launchers happy.
+  WINEDEBUG=-all "$(wine_exe "$backend")" reg add 'HKCU\Software\Wine' /v Version /d win10 /f >/dev/null 2>&1
+  info "bottle ready: $dir"
+}
+
+cmd_list() {
+  shopt -s nullglob
+  for d in "$BOTTLES"/*/bottle.conf; do
+    local name; name="$(basename "$(dirname "$d")")"
+    printf '%-20s %s\n' "$name" "$(grep BACKEND "$d")"
+  done
+}
+
+cmd_delete() {
+  local name="${1:?usage: macgames delete <name>}"
+  load_bottle "$name"
+  "$(wine_bin_dir "$BACKEND")/wineserver" -k 2>/dev/null || true
+  rm -rf "$(bottle_dir "$name")"
+  info "deleted '$name'"
+}
+
+# ---------------------------------------------------------------- running
+
+cmd_run() { # bottle exe [args...]
+  local bottle="${1:?usage: macgames run <bottle> <exe> [args...]}" exe="${2:?missing exe}"; shift 2
+  load_bottle "$bottle"
+  wine_in "$bottle" "$BACKEND" "$exe" "$@"
+}
+
+cmd_kill() {
+  local bottle="${1:?usage: macgames kill <bottle>}"
+  load_bottle "$bottle"
+  "$(wine_bin_dir "$BACKEND")/wineserver" -k || true
+}
+
+# ---------------------------------------------------------------- steam
+
+steam_dir() { echo "$WINEPREFIX/drive_c/Program Files (x86)/Steam"; }
+
+# Steam's 32-bit updater crashes under wine-staging while fetching the 64-bit
+# client, and the 64-bit client crashes under GPTK Wine. So the update runs in a
+# throwaway GPTK bottle and the finished Steam folder is copied over.
+bootstrap_steam() { # -> path of an up-to-date Steam folder
+  local boot="$BOTTLES/.steam-bootstrap"
+  local dir="$boot/prefix/drive_c/Program Files (x86)/Steam"
+  if [[ ! -f "$dir/package/steam_client_win64.installed" ]]; then
+    [[ -f "$boot/bottle.conf" ]] || cmd_create .steam-bootstrap d3dmetal >&2
+    load_bottle .steam-bootstrap
+    [[ -f "$dir/steam.exe" ]] || wine_in .steam-bootstrap d3dmetal "$(fetch "$STEAM_URL")" /S >/dev/null
+    info "downloading the Steam client (one-off, ~300 MB)"
+    wine_in .steam-bootstrap d3dmetal "$STEAM_EXE" "${STEAM_FLAGS[@]}" >/dev/null &
+    local i
+    for ((i = 0; i < 180; i++)); do
+      [[ -f "$dir/package/steam_client_win64.installed" ]] && break
+      sleep 5
+    done
+    sleep 5
+    "$(wine_bin_dir d3dmetal)/wineserver" -k 2>/dev/null || true
+    wait 2>/dev/null || true
+    [[ -f "$dir/package/steam_client_win64.installed" ]] || die "Steam client download did not finish"
+  fi
+  echo "$dir"
+}
+
+cmd_install_steam() {
+  local bottle="${1:?usage: macgames install-steam <bottle>}"
+  load_bottle "$bottle"
+  [[ "$BACKEND" == d3dmetal ]] && info "warning: the 64-bit Steam client currently crashes under GPTK Wine; use a dxmt or wined3d bottle"
+  info "installing Windows Steam into '$bottle'"
+  wine_in "$bottle" "$BACKEND" "$(fetch "$STEAM_URL")" /S >/dev/null
+  local src; src="$(bootstrap_steam)"
+  load_bottle "$bottle"
+  local dst; dst="$(steam_dir)"
+  [[ -d "$dst/steamapps" ]] && die "'$dst' already has games; not overwriting"
+  rm -rf "$dst" && cp -Rc "$src" "$dst" && rm -f "$dst"/*.old
+  info "done — start it with: macgames steam $bottle"
+}
+
+# Steam's Chromium UI needs these flags under Wine on macOS.
+STEAM_FLAGS=(-cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-sandbox -cef-in-process-gpu)
+
+cmd_steam() { # bottle [steam args...]
+  local bottle="${1:?usage: macgames steam <bottle>}"; shift
+  load_bottle "$bottle"
+  wine_in "$bottle" "$BACKEND" "$STEAM_EXE" "${STEAM_FLAGS[@]}" "$@"
+}
+
+steamapps() { echo "$(steam_dir)/steamapps"; }
+
+cmd_games() {
+  local bottle="${1:?usage: macgames games <bottle>}"
+  load_bottle "$bottle"
+  shopt -s nullglob
+  for m in "$(steamapps)"/appmanifest_*.acf; do
+    local id name state
+    id="$(sed -n 's/.*"appid"[[:space:]]*"\([0-9]*\)".*/\1/p' "$m" | head -1)"
+    name="$(sed -n 's/.*"name"[[:space:]]*"\(.*\)".*/\1/p' "$m" | head -1)"
+    state="$(sed -n 's/.*"StateFlags"[[:space:]]*"\([0-9]*\)".*/\1/p' "$m" | head -1)"
+    printf '%-10s %-40s %s\n' "$id" "$name" "$([[ "$state" == 4 ]] && echo installed || echo "downloading/state=$state")"
+  done
+}
+
+# compat/<appid>.conf can set ARGS="..." and ENV="K=V K=V" for a game.
+cmd_launch() { # bottle appid
+  local bottle="${1:?usage: macgames launch <bottle> <appid>}" appid="${2:?missing appid}"
+  load_bottle "$bottle"
+  local ARGS="" ENV=""
+  if [[ -f "$COMPAT/$appid.conf" ]]; then
+    # shellcheck disable=SC1090
+    source "$COMPAT/$appid.conf"
+    info "using compat profile compat/$appid.conf"
+  fi
+  local kv; for kv in $ENV; do export "${kv?}"; done
+  # shellcheck disable=SC2086
+  wine_in "$bottle" "$BACKEND" "$STEAM_EXE" "${STEAM_FLAGS[@]}" -applaunch "$appid" $ARGS
+}
+
+usage() {
+  cat <<EOF
+macgames — Windows games on Apple Silicon
+
+  setup                          download Wine, DXMT and Game Porting Toolkit runtimes
+  create <bottle> [backend]      new Wine prefix; backend: dxmt (default) | wined3d | d3dmetal
+  list                           list bottles
+  delete <bottle>                remove a bottle
+  run <bottle> <exe> [args]      run a Windows program
+  kill <bottle>                  stop everything in a bottle
+  install-steam <bottle>         install Windows Steam
+  steam <bottle>                 open Steam
+  games <bottle>                 list Steam games in the bottle
+  launch <bottle> <appid>        start a Steam game (applies compat/<appid>.conf)
+
+  HUD=1 macgames ...             show the Metal performance HUD
+  WINEDEBUG=+err macgames ...    more Wine logging (saved to bottles/<bottle>/last-run.log)
+EOF
+}
+
+# Wrapped in main so bash parses the whole file before running anything.
+main() {
+  cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    setup) cmd_setup "$@" ;;
+    create) cmd_create "$@" ;;
+    list) cmd_list ;;
+    delete) cmd_delete "$@" ;;
+    run) cmd_run "$@" ;;
+    kill) cmd_kill "$@" ;;
+    install-steam) cmd_install_steam "$@" ;;
+    steam) cmd_steam "$@" ;;
+    games) cmd_games "$@" ;;
+    launch) cmd_launch "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"; exit
