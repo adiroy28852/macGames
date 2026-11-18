@@ -78,6 +78,8 @@ ENV="DXMT_LOG_LEVEL=none"   # extra environment variables
 
 ## Known issues
 
+- Steam's login and library windows paint solid black under Wine on macOS (Chromium/CEF 126). `macgames steam` and `launch` swap in a tiny wrapper (`tools/webhelper-wrapper`) for `steamwebhelper.exe` that runs Valve's helper with `--disable-gpu --single-process`, start Steam with `-noverifyfiles` so it doesn't undo that, and run it inside a Wine virtual desktop sized to the screen (override with `DESKTOP=1920x1080`).
+
 - Steam's 32-bit updater crashes under wine-staging while fetching the 64-bit client, and that client crashes under GPTK Wine 7.7. `install-steam` works around this: it downloads the client in a hidden GPTK bottle (`bottles/.steam-bootstrap`) — where only the 32-bit updater runs — and copies the finished Steam folder into your bottle, where the modern Wine runs it.
 - Kernel-level anti-cheat games (Valorant, Fortnite and others) won't run.
 - The vkd3d D3D12 path tops out at feature level 11_0 on this hardware. Games that hard-require 12_1-only features won't start; most that offer a DX11 mode are better off in a `dxmt` bottle.

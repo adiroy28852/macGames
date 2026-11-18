@@ -220,13 +220,43 @@ cmd_install_steam() {
   info "done — start it with: macgames steam $bottle"
 }
 
-# Steam's Chromium UI needs these flags under Wine on macOS.
-STEAM_FLAGS=(-cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-sandbox -cef-in-process-gpu)
+# Steam's Chromium UI paints a black window under Wine on macOS unless
+# steamwebhelper runs with --disable-gpu --single-process. Steam doesn't pass
+# those through, so tools/webhelper-wrapper stands in for steamwebhelper.exe
+# and starts Valve's helper (moved to steamwebhelper_real.exe) with them.
+# -noverifyfiles stops Steam from restoring the original helper.
+STEAM_FLAGS=(-noverifyfiles -cef-disable-sandbox)
+WEBHELPER_WRAPPER="$ROOT/tools/webhelper-wrapper/steamwebhelper.exe"
+
+install_webhelper_wrapper() { # needs WINEPREFIX
+  local cef
+  for cef in "$(steam_dir)"/bin/cef/cef.win*; do
+    [[ -f "$cef/steamwebhelper.exe" ]] || continue
+    cmp -s "$WEBHELPER_WRAPPER" "$cef/steamwebhelper.exe" && continue
+    # Steam updates replace steamwebhelper.exe with Valve's; stash the new one.
+    mv -f "$cef/steamwebhelper.exe" "$cef/steamwebhelper_real.exe"
+    cp "$WEBHELPER_WRAPPER" "$cef/steamwebhelper.exe"
+  done
+}
+
+# Run Steam inside a Wine virtual desktop the size of the Mac screen.
+steam_in() { # bottle [steam args...]
+  local bottle="$1"; shift
+  install_webhelper_wrapper
+  local size="${DESKTOP:-}"
+  if [[ -z "$size" ]]; then
+    size="$(osascript -e 'tell application "Finder" to get bounds of window of desktop' 2>/dev/null |
+      awk -F', ' '{print $3 "x" $4}')"
+  fi
+  rm -f "$WINEPREFIX"/drive_c/users/*/AppData/Local/Steam/htmlcache/Singleton*
+  wine_in "$bottle" "$BACKEND" explorer.exe "/desktop=steam,${size:-1440x900}" \
+    "$STEAM_EXE" "${STEAM_FLAGS[@]}" "$@"
+}
 
 cmd_steam() { # bottle [steam args...]
   local bottle="${1:?usage: macgames steam <bottle>}"; shift
   load_bottle "$bottle"
-  wine_in "$bottle" "$BACKEND" "$STEAM_EXE" "${STEAM_FLAGS[@]}" "$@"
+  steam_in "$bottle" "$@"
 }
 
 steamapps() { echo "$(steam_dir)/steamapps"; }
@@ -256,7 +286,7 @@ cmd_launch() { # bottle appid
   fi
   local kv; for kv in $ENV; do export "${kv?}"; done
   # shellcheck disable=SC2086
-  wine_in "$bottle" "$BACKEND" "$STEAM_EXE" "${STEAM_FLAGS[@]}" -applaunch "$appid" $ARGS
+  steam_in "$bottle" -applaunch "$appid" $ARGS
 }
 
 usage() {
