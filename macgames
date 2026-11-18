@@ -25,10 +25,18 @@ info() { echo "==> $*" >&2; }
 
 # ---------------------------------------------------------------- runtimes
 
-# Each backend maps to a Wine build:
-#   wined3d  — stock Wine (DirectX → OpenGL)
-#   dxmt     — stock Wine with DXMT builtins (D3D10/11 → Metal)
-#   d3dmetal — Apple Game Porting Toolkit Wine (D3D11/12 → Metal)
+# Each backend maps to a Wine build and a Direct3D translation strategy:
+#   wined3d  — Wine 11.21; D3D9/10/11 → OpenGL, D3D12 → vkd3d → Vulkan → Metal.
+#   dxmt     — Wine 11.21 with DXMT builtins; D3D10/11 → Metal (fast), and
+#              D3D12 still via Wine's vkd3d. Runs Steam. The default.
+#   d3dmetal — Apple Game Porting Toolkit (Wine 7.7) with D3DMetal; D3D11/12 →
+#              Metal. Wine 7.7 is too old for the modern Steam client (it
+#              crashes on launch), so this backend is only for running a game's
+#              own .exe directly, not for Steam.
+#
+# wined3d and dxmt share the same Wine 11.21 build, so both run Steam and both
+# reach D3D12 through vkd3d. On Apple M5 that path tops out at feature level
+# 11_0 (see tools/d3d12-probe); games needing 12_1-only features won't start.
 wine_bin_dir() {
   case "$1" in
     wined3d)  echo "$RUNTIME/wine/Wine Staging.app/Contents/Resources/wine/bin" ;;
@@ -158,6 +166,17 @@ cmd_kill() {
   "$(wine_bin_dir "$BACKEND")/wineserver" -k || true
 }
 
+# Run the bundled D3D12 probe in a bottle to confirm the Direct3D → Metal path
+# works there, without needing a game installed.
+cmd_doctor() {
+  local bottle="${1:?usage: macgames doctor <bottle>}"
+  load_bottle "$bottle"
+  local probe="$ROOT/tools/d3d12-probe/probe.exe"
+  [[ -f "$probe" ]] || die "missing $probe"
+  info "probing Direct3D 12 in '$bottle' ($BACKEND)"
+  WINEDEBUG=-all "$(wine_exe "$BACKEND")" "$probe" 2>/dev/null
+}
+
 # ---------------------------------------------------------------- steam
 
 steam_dir() { echo "$WINEPREFIX/drive_c/Program Files (x86)/Steam"; }
@@ -190,7 +209,7 @@ bootstrap_steam() { # -> path of an up-to-date Steam folder
 cmd_install_steam() {
   local bottle="${1:?usage: macgames install-steam <bottle>}"
   load_bottle "$bottle"
-  [[ "$BACKEND" == d3dmetal ]] && info "warning: the 64-bit Steam client currently crashes under GPTK Wine; use a dxmt or wined3d bottle"
+  [[ "$BACKEND" == d3dmetal ]] && die "the modern Steam client crashes under the d3dmetal backend (Wine 7.7); create a dxmt or wined3d bottle for Steam"
   info "installing Windows Steam into '$bottle'"
   wine_in "$bottle" "$BACKEND" "$(fetch "$STEAM_URL")" /S >/dev/null
   local src; src="$(bootstrap_steam)"
@@ -250,6 +269,7 @@ macgames — Windows games on Apple Silicon
   delete <bottle>                remove a bottle
   run <bottle> <exe> [args]      run a Windows program
   kill <bottle>                  stop everything in a bottle
+  doctor <bottle>                check the Direct3D 12 path works in a bottle
   install-steam <bottle>         install Windows Steam
   steam <bottle>                 open Steam
   games <bottle>                 list Steam games in the bottle
@@ -270,6 +290,7 @@ main() {
     delete) cmd_delete "$@" ;;
     run) cmd_run "$@" ;;
     kill) cmd_kill "$@" ;;
+    doctor) cmd_doctor "$@" ;;
     install-steam) cmd_install_steam "$@" ;;
     steam) cmd_steam "$@" ;;
     games) cmd_games "$@" ;;

@@ -7,10 +7,29 @@ Run Windows games on Apple Silicon Macs, with no VM and no paid CrossOver licenc
 | Layer | Translates | Provided by |
 |---|---|---|
 | CPU | x86-64 → ARM64 | Rosetta 2 (built into macOS) |
-| OS | Windows API → macOS | Wine (wine-staging builds by Gcenx) |
-| Graphics | Direct3D → Metal | DXMT (D3D10/11), Apple's D3DMetal (via GPTK Wine), or WineD3D |
+| OS | Windows API → macOS | Wine 11.21 (wine-staging builds by Gcenx) |
+| Graphics | Direct3D → Metal | DXMT (D3D10/11), or Wine's vkd3d (D3D12 → Vulkan → Metal via MoltenVK) |
 
 `macgames` downloads pinned builds of these into `runtime/`, keeps each Wine prefix ("bottle") in `bottles/`, and wires up the environment and DLLs for the chosen backend.
+
+### Which backend for DirectX 12?
+
+The same Wine 11.21 build runs Steam **and** reaches D3D12 through its built-in
+vkd3d (D3D12 → Vulkan → MoltenVK → Metal). On an Apple M5 this creates a working
+D3D12 device at **feature level 11_0** — confirmed by `macgames doctor`, which
+runs a tiny probe (`tools/d3d12-probe`) with no game installed:
+
+```
+CreateDXGIFactory1: 0x00000000
+Adapter 0: NVIDIA GeForce 6800 (vendor 0x10de, dedVram 12124MB, flags 0x0)
+  D3D12CreateDevice OK at feature level 0xb000
+```
+
+(vkd3d spoofs the adapter *name* for game compatibility; the 12 GB VRAM is the
+real M5.) Apple's own D3DMetal is faster for D3D12, but it ships inside the Game
+Porting Toolkit on Wine 7.7, which is far too old to run today's Steam client —
+so it isn't usable as a Steam backend. For DX12 Steam games, use vkd3d; for DX11
+games, use DXMT.
 
 ## Quick start
 
@@ -26,11 +45,27 @@ HUD=1 ./macgames launch main 3404260   # with the Metal FPS overlay
 
 ## Backends
 
-- `dxmt`: wine-staging with DXMT swapped in for d3d11/dxgi/d3d10core. Best for D3D11 games.
-- `wined3d`: plain Wine (D3D → OpenGL). Slow, but the most compatible fallback.
-- `d3dmetal`: Wine from Apple's Game Porting Toolkit, which can run D3D12. The current 64-bit Windows Steam client crashes under this Wine, so it's only usable for non-Steam games for now.
+- `dxmt` (default): Wine 11.21 with DXMT swapped in for d3d11/dxgi/d3d10core. Best for D3D11 games; D3D12 still goes through vkd3d. Runs Steam.
+- `wined3d`: plain Wine 11.21. D3D9/10/11 → OpenGL (slower, most compatible), D3D12 → vkd3d. Runs Steam. Best for DX12 games, since DXMT's dxgi can get in vkd3d's way.
+- `d3dmetal`: Apple's Game Porting Toolkit (Wine 7.7) + D3DMetal. Fastest D3D12, but Wine 7.7 can't run the modern Steam client — use it only to launch a game's own `.exe` directly (`macgames run`).
 
-A bottle's backend is fixed when it's created. Prefixes from different Wine builds shouldn't be mixed.
+A bottle's backend is fixed when it's created. `dxmt` and `wined3d` share one Wine build; `d3dmetal` is a different, older one. Prefixes from different Wine builds shouldn't be mixed.
+
+## Commands
+
+```
+setup                      download Rosetta, Wine, DXMT and GPTK runtimes
+create <bottle> [backend]  new bottle (dxmt | wined3d | d3dmetal)
+list                       list bottles
+delete <bottle>            remove a bottle
+run <bottle> <exe> [args]  run a Windows program
+kill <bottle>              stop everything in a bottle
+doctor <bottle>            check the Direct3D 12 path works, no game needed
+install-steam <bottle>     install Windows Steam (dxmt/wined3d only)
+steam <bottle>             open Steam
+games <bottle>             list installed Steam games and app IDs
+launch <bottle> <appid>    start a Steam game (applies compat/<appid>.conf)
+```
 
 ## Per-game settings
 
@@ -43,6 +78,6 @@ ENV="DXMT_LOG_LEVEL=none"   # extra environment variables
 
 ## Known issues
 
-- Steam's 32-bit updater crashes under wine-staging while fetching the 64-bit client, and that client crashes under GPTK Wine. `install-steam` works around this: it runs the update in a hidden GPTK bottle (`bottles/.steam-bootstrap`) and copies the finished Steam folder into your bottle.
+- Steam's 32-bit updater crashes under wine-staging while fetching the 64-bit client, and that client crashes under GPTK Wine 7.7. `install-steam` works around this: it downloads the client in a hidden GPTK bottle (`bottles/.steam-bootstrap`) — where only the 32-bit updater runs — and copies the finished Steam folder into your bottle, where the modern Wine runs it.
 - Kernel-level anti-cheat games (Valorant, Fortnite and others) won't run.
-- D3D12-only games need `d3dmetal`, which can't run Steam yet (see above).
+- The vkd3d D3D12 path tops out at feature level 11_0 on this hardware. Games that hard-require 12_1-only features won't start; most that offer a DX11 mode are better off in a `dxmt` bottle.
