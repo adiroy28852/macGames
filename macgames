@@ -290,6 +290,31 @@ cmd_steam() { # bottle [steam args...]
   steam_in "$bottle" "$@"
 }
 
+steam_running() { pgrep -f 'Program Files \(x86\)\\Steam\\steam\.exe' >/dev/null; }
+
+# Family View relocks on every Steam start and blocks all launches
+# (AppError_45). Steam's UI exposes the PIN dialog's call over Chromium's
+# DevTools port, opened by .cef-enable-remote-debugging in the Steam folder.
+steam_unlock() { # pin; waits up to 2 minutes for Steam to be ready
+  touch "$(steam_dir)/.cef-enable-remote-debugging"
+  local i r
+  for ((i = 0; i < 60; i++)); do
+    r="$(python3 -I "$ROOT/tools/steam-cdp.py" "SteamClient.Parental.UnlockParentalLock('$1', true)" 2>/dev/null)" || r=""
+    case "$r" in
+      1) info "Family View unlocked"; return 0 ;;
+      "") sleep 2 ;;
+      *) die "Steam refused the Family View PIN (result $r)" ;;
+    esac
+  done
+  die "couldn't reach Steam's UI to unlock Family View (restart Steam once so its debugging port opens)"
+}
+
+cmd_unlock() { # bottle pin
+  local bottle="${1:?usage: macgames unlock <bottle> <pin>}" pin="${2:?missing PIN}"
+  load_bottle "$bottle"
+  steam_unlock "$pin"
+}
+
 steamapps() { echo "$(steam_dir)/steamapps"; }
 
 cmd_games() {
@@ -316,8 +341,17 @@ cmd_launch() { # bottle appid
     info "using compat profile compat/$appid.conf"
   fi
   local kv; for kv in $ENV; do export "${kv?}"; done
+  if [[ -z "${STEAM_PIN:-}" ]]; then
+    # shellcheck disable=SC2086
+    steam_in "$bottle" -applaunch "$appid" $ARGS
+    return
+  fi
+  # With a Family View PIN: start Steam if needed, unlock, then hand it the launch.
+  steam_running || { steam_in "$bottle" >/dev/null 2>&1 & }
+  steam_unlock "$STEAM_PIN"
   # shellcheck disable=SC2086
-  steam_in "$bottle" -applaunch "$appid" $ARGS
+  WINEDEBUG=-all "$(wine_exe "$BACKEND")" "$STEAM_EXE" -applaunch "$appid" $ARGS >/dev/null 2>&1
+  info "launched $appid; Steam keeps running in the background"
 }
 
 usage() {
@@ -335,7 +369,11 @@ macgames — Windows games on Apple Silicon
   steam <bottle>                 open Steam
   games <bottle>                 list Steam games in the bottle
   launch <bottle> <appid>        start a Steam game (applies compat/<appid>.conf)
+  unlock <bottle> <pin>          leave Steam Family View
 
+  STEAM_PIN=1234 macgames launch ...   unlock Family View first, then launch
+
+  METALFX=1 macgames launch ...  MetalFX upscaling (dxmt);  RETINA=0 ... low-DPI mode
   HUD=1 macgames ...             show the Metal performance HUD
   WINEDEBUG=+err macgames ...    more Wine logging (saved to bottles/<bottle>/last-run.log)
 EOF
@@ -356,6 +394,7 @@ main() {
     steam) cmd_steam "$@" ;;
     games) cmd_games "$@" ;;
     launch) cmd_launch "$@" ;;
+    unlock) cmd_unlock "$@" ;;
     help|-h|--help) usage ;;
     *) usage; exit 1 ;;
   esac
