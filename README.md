@@ -41,6 +41,8 @@ games, use DXMT.
 ./macgames games main             # list installed games and app IDs
 ./macgames launch main 3404260    # start a game; applies compat/3404260.conf
 HUD=1 ./macgames launch main 3404260   # with the Metal FPS overlay
+METALFX=1 ./macgames launch main 3404260   # MetalFX upscaling (DXMT)
+RETINA=0 ./macgames steam main           # opt out of full Retina resolution
 ```
 
 ## Backends
@@ -77,6 +79,11 @@ ENV="DXMT_LOG_LEVEL=none"   # extra environment variables
 ```
 
 ## Known issues
+
+- DXMT can't draw with stock Wine 11 ("Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT"), so every D3D11 game aborts at startup. Wine hides the macOS-driver functions DXMT calls, and Wine 11 reshaped the window data DXMT reads. `setup` rebuilds `winemac.so` from the matching Wine source with `tools/winemac-dxmt` (exported symbols plus a small compatibility table), keeping the original as `winemac.so.orig`.
+- The Steam overlay is disabled (`gameoverlayrenderer=d`): its DXGI hooks crash games on top of DXMT.
+- Steam Family View relocks every time Steam starts; unlock it in the Steam window before launching.
+- Launch from your own Terminal: processes started by a sandboxed tool (e.g. an AI coding agent's shell) get no audio device, and Unreal games exit when audio fails to start. `tools/audio-probe/probe.exe` checks audio output in a bottle.
 
 - Steam's login and library windows paint solid black under Wine on macOS (Chromium/CEF 126). `macgames steam` and `launch` swap in a tiny wrapper (`tools/webhelper-wrapper`) for `steamwebhelper.exe` that runs Valve's helper with `--disable-gpu --single-process`, start Steam with `-noverifyfiles` so it doesn't undo that, and run it inside a Wine virtual desktop sized to the screen (override with `DESKTOP=1920x1080`).
 

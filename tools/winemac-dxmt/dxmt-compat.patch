@@ -1,0 +1,87 @@
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -2207,4 +2207,84 @@
+     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+     pthread_mutex_init(&win_data_mutex, &attr);
+     pthread_mutexattr_destroy(&attr);
++}
++
++/***********************************************************************
++ *              DXMT compatibility
++ *
++ * DXMT (D3D11 -> Metal) looks up a CrossOver-style "macdrv_functions" table
++ * and reads the window's client view from a macdrv_win_data laid out as
++ * { hwnd, cocoa_window, cocoa_view, client_cocoa_view }. Wine 11 changed that
++ * struct and only creates a client view once a GL/Vulkan surface exists, so
++ * hand DXMT a copy in the old layout, creating a client surface if needed.
++ */
++struct dxmt_win_data
++{
++    HWND                     hwnd;
++    WineWindow              *cocoa_window;
++    WineContentView         *cocoa_view;
++    WineContentView         *client_cocoa_view;
++    struct macdrv_win_data  *data;
++};
++
++static struct dxmt_win_data *dxmt_get_win_data(HWND hwnd)
++{
++    struct macdrv_win_data *data;
++    struct dxmt_win_data *ret;
++
++    if (!(data = get_win_data(hwnd))) return NULL;
++    if (!data->client_view)
++    {
++        /* presenting the new surface makes its view the window's client_view;
++         * the surface reference is kept for the life of the window */
++        release_win_data(data);
++        macdrv_CreateClientSurface(hwnd, 0, TRUE);
++        if (!(data = get_win_data(hwnd))) return NULL;
++    }
++    if (!(ret = malloc(sizeof(*ret))))
++    {
++        release_win_data(data);
++        return NULL;
++    }
++    ret->hwnd = data->hwnd;
++    ret->cocoa_window = data->cocoa_window;
++    ret->cocoa_view = data->client_view;
++    ret->client_cocoa_view = data->client_view;
++    ret->data = data;
++    return ret;
+ }
++
++static void dxmt_release_win_data(struct dxmt_win_data *ret)
++{
++    if (!ret) return;
++    release_win_data(ret->data);
++    free(ret);
++}
++
++struct dxmt_macdrv_functions
++{
++    void (*macdrv_init_display_devices)(BOOL);
++    struct dxmt_win_data *(*get_win_data)(HWND hwnd);
++    void (*release_win_data)(struct dxmt_win_data *data);
++    WineWindow *(*macdrv_get_cocoa_window)(HWND hwnd, bool require_on_screen);
++    MTLDevice_id (*macdrv_create_metal_device)(void);
++    void (*macdrv_release_metal_device)(MTLDevice_id d);
++    WineMetalView *(*macdrv_view_create_metal_view)(WineContentView *v, MTLDevice_id d);
++    CAMetalLayer *(*macdrv_view_get_metal_layer)(WineMetalView *v);
++    void (*macdrv_view_release_metal_view)(WineMetalView *v);
++    void (*on_main_thread)(void *block);
++};
++
++__attribute__((visibility("default"))) const struct dxmt_macdrv_functions macdrv_functions =
++{
++    NULL,
++    dxmt_get_win_data,
++    dxmt_release_win_data,
++    macdrv_get_cocoa_window,
++    macdrv_create_metal_device,
++    macdrv_release_metal_device,
++    macdrv_view_create_metal_view,
++    macdrv_view_get_metal_layer,
++    macdrv_view_release_metal_view,
++    NULL,
++};
