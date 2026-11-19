@@ -1,2 +1,3 @@
-runtime/
-bottles/
+/dependencies/
+/bottles/
+/env/.env

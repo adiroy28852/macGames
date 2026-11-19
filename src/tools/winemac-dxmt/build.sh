@@ -33,6 +33,11 @@ without=(--disable-tests --without-freetype --without-gstreamer --without-sdl --
   --without-v4l2 --without-x --without-capi --without-gphoto --without-inotify --without-opencl
   --without-pulse --without-oss --without-udev --without-dbus --without-ffmpeg --without-wayland --without-vulkan)
 
+# configure records absolute paths; start over if the build dir has moved.
+for d in "$build/tools" "$build/obj"; do
+  if [[ -f "$d/Makefile" ]] && ! grep -qF "$src" "$d/Makefile"; then rm -rf "$d"; fi
+done
+
 # Native build tools (widl, winebuild, ...) first: the driver is cross-built for x86_64.
 if [[ ! -x "$build/tools/tools/winebuild/winebuild" ]]; then
   mkdir -p "$build/tools"
@@ -49,7 +54,7 @@ fi
 (cd "$build/obj" && make -j"$(sysctl -n hw.ncpu)" dlls/winemac.drv/winemac.so >make-winemac.out)
 
 built="$build/obj/dlls/winemac.drv/winemac.so"
-nm -gU "$built" | grep -q _macdrv_functions || { echo "built winemac.so lacks macdrv_functions" >&2; exit 1; }
+nm -gU "$built" | grep _macdrv_functions >/dev/null || { echo "built winemac.so lacks macdrv_functions" >&2; exit 1; }
 [[ -f "$dest.orig" ]] || cp "$dest" "$dest.orig"
 rm -f "$dest" && cp "$built" "$dest" && codesign -s - -f "$dest" 2>/dev/null
 echo "installed DXMT-compatible winemac.so"
