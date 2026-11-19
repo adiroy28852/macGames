@@ -38,6 +38,8 @@ cp env/.env.example env/.env
 |---|---|---|
 | `STEAM_PIN` | empty | Steam Family View PIN; `launch` unlocks Family View first when set |
 | `SHOW_BENCHMARKS` | `false` | Metal performance overlay (FPS, frame time, GPU time, memory) in the top-right corner |
+| `GOVERNOR` | `true` | while a game runs, pause Steam's UI and move Steam/Wine helpers to the efficiency cores |
+| `AVX` | `true` | let games see AVX/AVX2/FMA/BMI2 (Rosetta, macOS 15+) |
 | `METALFX` | `0` | MetalFX upscaling (dxmt) |
 | `RETINA` | `1` | `0` for low-DPI mode |
 | `DESKTOP` | screen size | Steam virtual desktop size, e.g. `1920x1080` |
@@ -79,6 +81,19 @@ SHOW_BENCHMARKS=true ./macgames launch main 3404260   # with the FPS/memory over
 METALFX=1 ./macgames launch main 3404260   # MetalFX upscaling (DXMT)
 RETINA=0 ./macgames steam main           # opt out of full Retina resolution
 ```
+
+## Governor: more of the Mac for the game
+
+Steam has to keep running while you play (games talk to it for DRM, achievements and saves), but most of it isn't needed. When Steam starts, `macgames` starts a small governor for that bottle (log: `bottles/<bottle>/governor.log`). While a game runs it:
+
+- pauses Steam's Chromium UI (`steamwebhelper`, ~0.8 GB), which the game never talks to, so it uses no CPU and macOS can compress its memory under pressure;
+- moves `steam.exe`, `steamservice` and Wine's background services (`services`, `winedevice`, `plugplay`, `svchost`, `rpcss`, `lsass`) to the efficiency cores with `taskpolicy -b`.
+
+`wineserver` and `explorer.exe` (the virtual desktop that hosts the game window) keep normal priority, because the game waits on both. When the game exits everything is resumed and restored; the governor stops with Steam. `GOVERNOR=false` turns it off. Steam's window is frozen while a game runs; that's expected.
+
+## CPU features (AVX)
+
+Rosetta hides AVX from x86 programs unless asked, and games built for AVX refuse to start. `macgames` sets `ROSETTA_ADVERTISE_AVX=1` (macOS 15+), so games see AVX, AVX2, FMA, F16C and BMI2 (no AVX-512). `macgames doctor <bottle>` prints what a Windows program sees (`src/tools/cpu-probe`).
 
 ## Backends
 

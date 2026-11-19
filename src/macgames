@@ -145,6 +145,7 @@ wine_in() { # bottle backend cmd...
   [[ -x "$wine" ]] || die "runtime for '$backend' missing — run: macgames setup"
   export WINEDEBUG="${WINEDEBUG:--all}"
   export WINEESYNC=1 WINEMSYNC=1
+  cpu_env
   benchmarks_env
   case "$backend" in
     d3dmetal) export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}dxgi,d3d9,d3d10core,d3d11,d3d12=b" ;;
@@ -155,6 +156,10 @@ wine_in() { # bottle backend cmd...
   local log="$(bottle_dir "$bottle")/last-run.log"
   "$wine" "$@" 2>&1 | tee "$log"
 }
+
+# Rosetta hides AVX/AVX2/FMA/BMI2 from x86 programs unless asked; games built
+# for AVX then refuse to start. AVX=false turns it back off.
+cpu_env() { is_true "${AVX:-true}" && export ROSETTA_ADVERTISE_AVX=1 || true; }
 
 # SHOW_BENCHMARKS=true turns on Apple's Metal performance HUD (FPS, frame
 # time, GPU time, memory) in the top-right corner of every Metal window. Games
@@ -216,6 +221,9 @@ cmd_doctor() {
   load_bottle "$bottle"
   local probe="$TOOLS/d3d12-probe/probe.exe"
   [[ -f "$probe" ]] || die "missing $probe"
+  cpu_env
+  info "CPU features seen by Windows programs"
+  WINEDEBUG=-all "$(wine_exe "$BACKEND")" "$TOOLS/cpu-probe/probe.exe" 2>/dev/null
   info "probing Direct3D 12 in '$bottle' ($BACKEND)"
   WINEDEBUG=-all "$(wine_exe "$BACKEND")" "$probe" 2>/dev/null
 }
@@ -314,13 +322,17 @@ sync_launch_options() {
 
 # Settings that games inherit from the running Steam rather than from the
 # `launch` that asked for them; Steam restarts when these change.
-steam_session() { echo "SHOW_BENCHMARKS=$(is_true "${SHOW_BENCHMARKS:-}" && echo 1 || echo 0) METALFX=$(is_true "${METALFX:-}" && echo 1 || echo 0)"; }
+steam_session() {
+  echo "SHOW_BENCHMARKS=$(is_true "${SHOW_BENCHMARKS:-}" && echo 1 || echo 0)" \
+    "METALFX=$(is_true "${METALFX:-}" && echo 1 || echo 0) AVX=$(is_true "${AVX:-true}" && echo 1 || echo 0)"
+}
 steam_session_file() { echo "$(bottle_dir "$1")/steam-session"; }
 
 # Run Steam inside a Wine virtual desktop the size of the Mac screen.
 steam_in() { # bottle [steam args...]
   local bottle="$1"; shift
   steam_running || steam_session > "$(steam_session_file "$bottle")"
+  governor_start "$bottle"
   install_webhelper_wrapper
   sync_launch_options
   apply_display_settings "$bottle" "$BACKEND"
@@ -346,6 +358,62 @@ cmd_steam() { # bottle [steam args...]
 }
 
 steam_running() { pgrep -f 'Program Files \(x86\)\\Steam\\steam\.exe' >/dev/null; }
+
+# ---------------------------------------------------------------- governor
+
+# While a game runs, everything else in Wine gives it room: Steam's Chromium UI
+# (steamwebhelper, ~0.5-1 GB, which the game never talks to) is paused so
+# macOS can compress its memory, and Steam and Wine's background services are
+# moved to the efficiency cores with taskpolicy. wineserver and explorer (the
+# virtual desktop hosting the game window) are left alone: the game waits on
+# both. All of it is undone when the game exits. GOVERNOR=false turns it off.
+GOV_GAME='steamapps\\common\\.*\.exe'
+GOV_PAUSE='steamwebhelper(_real)?\.exe'
+# Anchored: explorer's own command line contains ...\\Steam\\steam.exe as an argument.
+GOV_DEMOTE='^C:\\(Program Files \(x86\)\\Steam\\steam|Program Files \(x86\)\\Common Files\\Steam\\steamservice|windows\\system32\\(services|winedevice|plugplay|svchost|rpcss|lsass))\.exe'
+
+game_running() { pgrep -f "$GOV_GAME" | while read -r pid; do
+  ps -o command= -p "$pid" | grep -qi crashpad || { echo "$pid"; break; }; done | grep -q .; }
+
+governor_loop() { # bottle
+  local paused=" " demoted=" " pid active=0
+  log() { echo "$(date '+%F %T') $*"; }
+  restore() {
+    for pid in $paused; do kill -CONT "$pid" 2>/dev/null || true; done
+    for pid in $demoted; do taskpolicy -B -p "$pid" 2>/dev/null || true; done
+    if [[ "$active" == 1 ]]; then log "game exited: resumed Steam UI, restored priorities"; fi
+    paused=" " demoted=" " active=0
+  }
+  trap 'restore; exit 0' TERM INT HUP
+  log "governor watching bottle '$1'"
+  while steam_running; do
+    if game_running; then
+      [[ "$active" == 1 ]] || { active=1; log "game started: pausing Steam UI, moving helpers to efficiency cores"; }
+      for pid in $(pgrep -f "$GOV_PAUSE"); do
+        [[ "$paused" == *" $pid "* ]] || { kill -STOP "$pid" 2>/dev/null && paused+="$pid "; }
+      done
+      for pid in $(pgrep -f "$GOV_DEMOTE"); do
+        [[ "$demoted" == *" $pid "* ]] || { taskpolicy -b -p "$pid" 2>/dev/null && demoted+="$pid "; }
+      done
+    elif [[ "$active" == 1 ]]; then
+      restore
+    fi
+    sleep 2
+  done
+  restore
+  log "Steam exited; governor stopped"
+}
+
+governor_start() { # bottle; one governor per bottle, lives as long as Steam
+  is_true "${GOVERNOR:-true}" || return 0
+  local pidf; pidf="$(bottle_dir "$1")/governor.pid"
+  [[ -f "$pidf" ]] && kill -0 "$(cat "$pidf")" 2>/dev/null && return 0
+  # Steam may still be starting; wait for it before watching.
+  ( for ((i = 0; i < 60; i++)); do steam_running && break; sleep 2; done
+    governor_loop "$1" ) >>"$(bottle_dir "$1")/governor.log" 2>&1 &
+  echo $! > "$pidf"
+  disown $! 2>/dev/null || true
+}
 
 steam_stop() { # needs WINEPREFIX, BACKEND
   WINEDEBUG=-all "$(wine_exe "$BACKEND")" "$STEAM_EXE" -shutdown >/dev/null 2>&1 || true
@@ -426,6 +494,7 @@ cmd_launch() { # bottle appid
   steam_running || { started="$(date +%s)"; steam_in "$bottle" >/dev/null 2>&1 & }
   steam_unlock "$STEAM_PIN" "$started"
   # shellcheck disable=SC2086
+  governor_start "$bottle"
   WINEDEBUG=-all "$(wine_exe "$BACKEND")" "$STEAM_EXE" -applaunch "$appid" $ARGS >/dev/null 2>&1
   info "launched $appid; Steam keeps running in the background"
 }
@@ -450,6 +519,8 @@ macgames — Windows games on Apple Silicon
 Settings live in env/.env (copy env/.env.example); shell variables override it:
   STEAM_PIN=1234                 unlock Family View before every launch
   SHOW_BENCHMARKS=true           FPS/frame time/memory overlay, top-right
+  GOVERNOR=false                 don't pause Steam's UI / demote helpers while a game runs
+  AVX=false                      hide AVX/AVX2 from games (Rosetta)
   METALFX=1                      MetalFX upscaling (dxmt);  RETINA=0  low-DPI mode
   WINEDEBUG=+err                 more Wine logging (saved to bottles/<bottle>/last-run.log)
 EOF
