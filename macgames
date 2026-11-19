@@ -264,10 +264,27 @@ apply_display_settings() { # bottle backend
   reg 'HKLM\System\CurrentControlSet\Hardware Profiles\Current\Software\Fonts' /v LogPixels /t REG_DWORD /d "$dpi"
 }
 
+# Copy each compat/<appid>.conf ARGS into Steam's Launch Options so the Play
+# button uses them too. Steam rewrites localconfig.vdf on exit, so only while it's stopped.
+sync_launch_options() {
+  steam_running && return
+  local cfg conf appid
+  for cfg in "$(steam_dir)"/userdata/*/config/localconfig.vdf; do
+    [[ -f "$cfg" ]] || continue
+    for conf in "$COMPAT"/*.conf; do
+      appid="$(basename "$conf" .conf)"
+      local ARGS="" ENV=""; # shellcheck disable=SC1090
+      source "$conf"
+      [[ -n "$ARGS" ]] && python3 -I "$ROOT/tools/steam-launch-options.py" "$cfg" "$appid" "$ARGS" 2>/dev/null || true
+    done
+  done
+}
+
 # Run Steam inside a Wine virtual desktop the size of the Mac screen.
 steam_in() { # bottle [steam args...]
   local bottle="$1"; shift
   install_webhelper_wrapper
+  sync_launch_options
   apply_display_settings "$bottle" "$BACKEND"
   local size="${DESKTOP:-}" scale=2
   [[ "${RETINA:-1}" == 0 ]] && scale=1
@@ -295,10 +312,16 @@ steam_running() { pgrep -f 'Program Files \(x86\)\\Steam\\steam\.exe' >/dev/null
 # Family View relocks on every Steam start and blocks all launches
 # (AppError_45). Steam's UI exposes the PIN dialog's call over Chromium's
 # DevTools port, opened by .cef-enable-remote-debugging in the Steam folder.
-steam_unlock() { # pin; waits up to 2 minutes for Steam to be ready
+steam_unlock() { # pin [epoch Steam was started]; waits up to 2 minutes for Steam to be ready
   touch "$(steam_dir)/.cef-enable-remote-debugging"
-  local i r
+  local plog="$(steam_dir)/logs/parental_log.txt" started="${2:-0}" i r
+  # Before login the unlock answers 5 (invalid password), indistinguishable
+  # from a wrong PIN, so wait until Steam applies Family View after logging on.
   for ((i = 0; i < 60; i++)); do
+    [[ -f "$plog" && "$(stat -f %m "$plog")" -ge "$started" ]] && break
+    sleep 2
+  done
+  for ((i = 0; i < 30; i++)); do
     r="$(python3 -I "$ROOT/tools/steam-cdp.py" "SteamClient.Parental.UnlockParentalLock('$1', true)" 2>/dev/null)" || r=""
     case "$r" in
       1) info "Family View unlocked"; return 0 ;;
@@ -347,8 +370,9 @@ cmd_launch() { # bottle appid
     return
   fi
   # With a Family View PIN: start Steam if needed, unlock, then hand it the launch.
-  steam_running || { steam_in "$bottle" >/dev/null 2>&1 & }
-  steam_unlock "$STEAM_PIN"
+  local started=0
+  steam_running || { started="$(date +%s)"; steam_in "$bottle" >/dev/null 2>&1 & }
+  steam_unlock "$STEAM_PIN" "$started"
   # shellcheck disable=SC2086
   WINEDEBUG=-all "$(wine_exe "$BACKEND")" "$STEAM_EXE" -applaunch "$appid" $ARGS >/dev/null 2>&1
   info "launched $appid; Steam keeps running in the background"
