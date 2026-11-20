@@ -468,11 +468,12 @@ cmd_games() {
 }
 
 # games/<appid>/game.conf can set NAME, ARGS="..." and ENV="K=V K=V" for a game.
-cmd_launch() { # bottle appid
-  local bottle="${1:?usage: macgames launch <bottle> <appid>}" appid="${2:?missing appid}"
+# Without an appid it only opens Steam (unlocking Family View when STEAM_PIN is set).
+cmd_launch() { # bottle [appid]
+  local bottle="${1:?usage: macgames launch <bottle> [appid]}" appid="${2:-}"
   load_bottle "$bottle"
   local NAME="" ARGS="" ENV=""
-  if [[ -f "$GAMES/$appid/game.conf" ]]; then
+  if [[ -n "$appid" && -f "$GAMES/$appid/game.conf" ]]; then
     # shellcheck disable=SC1090
     source "$GAMES/$appid/game.conf"
     info "using games/$appid/game.conf${NAME:+ ($NAME)}"
@@ -485,6 +486,7 @@ cmd_launch() { # bottle appid
     steam_stop
   fi
   if [[ -z "${STEAM_PIN:-}" ]]; then
+    if [[ -z "$appid" ]]; then steam_running && info "Steam is already running" || steam_in "$bottle"; return; fi
     # shellcheck disable=SC2086
     steam_in "$bottle" -applaunch "$appid" $ARGS
     return
@@ -493,6 +495,7 @@ cmd_launch() { # bottle appid
   local started=0
   steam_running || { started="$(date +%s)"; steam_in "$bottle" >/dev/null 2>&1 & }
   steam_unlock "$STEAM_PIN" "$started"
+  [[ -n "$appid" ]] || { info "Steam is open"; return; }
   # shellcheck disable=SC2086
   governor_start "$bottle"
   WINEDEBUG=-all "$(wine_exe "$BACKEND")" "$STEAM_EXE" -applaunch "$appid" $ARGS >/dev/null 2>&1
@@ -513,7 +516,7 @@ macgames — Windows games on Apple Silicon
   install-steam <bottle>         install Windows Steam
   steam <bottle>                 open Steam
   games <bottle>                 list Steam games in the bottle
-  launch <bottle> <appid>        start a Steam game (applies games/<appid>/game.conf)
+  launch <bottle> [appid]        start a Steam game (applies games/<appid>/game.conf); no appid: just Steam
   unlock <bottle> [pin]          leave Steam Family View (PIN defaults to STEAM_PIN)
 
 Settings live in env/.env (copy env/.env.example); shell variables override it:

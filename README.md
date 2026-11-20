@@ -76,6 +76,7 @@ cp env/.env.example env/.env      # settings: Family View PIN, benchmarks overla
 ./macgames install-steam main     # Windows Steam, already updated
 ./macgames steam main             # log in, install your game
 ./macgames games main             # list installed games and app IDs
+./macgames launch main            # just Steam (unlocks Family View when STEAM_PIN is set)
 ./macgames launch main 3404260    # start a game; applies games/3404260/game.conf
 SHOW_BENCHMARKS=true ./macgames launch main 3404260   # with the FPS/memory overlay
 METALFX=1 ./macgames launch main 3404260   # MetalFX upscaling (DXMT)
@@ -116,7 +117,7 @@ doctor <bottle>            check the Direct3D 12 path works, no game needed
 install-steam <bottle>     install Windows Steam (dxmt/wined3d only)
 steam <bottle>             open Steam
 games <bottle>             list installed Steam games and app IDs
-launch <bottle> <appid>    start a Steam game (applies games/<appid>/game.conf)
+launch <bottle> [appid]    start a Steam game (applies games/<appid>/game.conf); no appid: just Steam
 unlock <bottle> [pin]      leave Steam Family View (PIN defaults to STEAM_PIN)
 ```
 
