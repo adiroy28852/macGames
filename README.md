@@ -7,10 +7,10 @@ Run Windows games on Apple Silicon Macs, with no VM and no paid CrossOver licenc
 | Layer | Translates | Provided by |
 |---|---|---|
 | CPU | x86-64 → ARM64 | Rosetta 2 (built into macOS) |
-| OS | Windows API → macOS | Wine 11.21 (wine-staging builds by Gcenx) |
-| Graphics | Direct3D → Metal | DXMT (D3D10/11), or Wine's vkd3d (D3D12 → Vulkan → Metal via MoltenVK) |
+| OS | Windows API → macOS | CrossOver's Wine 11.0, built here from CodeWeavers' GPL source |
+| Graphics | Direct3D 10/11/12 → Metal | Apple's D3DMetal (from the Game Porting Toolkit) |
 
-`macgames` downloads pinned builds of these into `dependencies/`, keeps each Wine prefix ("bottle") in `bottles/`, and wires up the environment and DLLs for the chosen backend.
+`macgames` downloads and builds these into `dependencies/`, keeps each Wine prefix ("bottle") in `bottles/`, and wires up the environment and DLLs for the chosen backend. One bottle with one Steam runs every game; the older Wine Staging 11.21 backends (DXMT, wined3d) remain available.
 
 ## Layout
 
@@ -24,6 +24,8 @@ dependencies/         third-party software, downloaded or built by `setup` (git-
   wine-dxmt/          Wine Staging 11.21 + DXMT, with the rebuilt winemac.so
   dxmt/  gptk/        DXMT 0.80, Apple Game Porting Toolkit 3.0
   wine-build/         Wine source and build tree for winemac.so
+  wine-crossover/     CrossOver's Wine 11.0 + D3DMetal (built by src/tools/wine-crossover)
+  cx-build/           CrossOver source and build tree
 games/<steam appid>/  per-game settings (game.conf)
 bottles/              Wine prefixes, with Steam and its game installs (git-ignored)
 ```
@@ -48,38 +50,41 @@ A variable set in the shell overrides the file, e.g. `SHOW_BENCHMARKS=true ./mac
 
 Games are started by Steam and inherit Steam's environment, so `launch` remembers which `SHOW_BENCHMARKS`/`METALFX` values Steam was started with (`bottles/<bottle>/steam-session`) and restarts Steam when they've changed. With `SHOW_BENCHMARKS=true` the overlay then appears as soon as the game starts rendering, whether you use `launch` or the Play button.
 
-### Which backend for DirectX 12?
+### Why CrossOver's Wine?
 
-The same Wine 11.21 build runs Steam **and** reaches D3D12 through its built-in
-vkd3d (D3D12 → Vulkan → MoltenVK → Metal). On an Apple M5 this creates a working
-D3D12 device at **feature level 11_0** — confirmed by `macgames doctor`, which
-runs a tiny probe (`src/tools/d3d12-probe`) with no game installed:
+Upstream Wine can't host D3DMetal on macOS any more: D3DMetal's DLLs call their
+own macOS code straight from Windows threads, which breaks once Wine points
+`%gs` at the TEB (Wine 10+), and they import ntdll's `__wine_unix_call`, which
+Wine 11 removed. Apple's GPTK keeps D3DMetal on Wine 7.7, too old for today's
+Steam. CrossOver's Wine keeps both working and has D3DMetal's window hooks, and
+CodeWeavers publish its source under the GPL, so `setup` builds it
+(`src/tools/wine-crossover/build.sh`, ~30 minutes) and adds GPTK's D3DMetal.
+`macgames doctor` then shows DirectX 12 at feature level **12_1** (vkd3d on the
+Wine 11.21 backends stops at 11_0):
 
 ```
 CreateDXGIFactory1: 0x00000000
-Adapter 0: NVIDIA GeForce 6800 (vendor 0x10de, dedVram 12124MB, flags 0x0)
-  D3D12CreateDevice OK at feature level 0xb000
+Adapter 0: AMD Compatibility Mode (vendor 0x1002, dedVram 12124MB, flags 0x0)
+  D3D12CreateDevice OK at feature level 0xc100
 ```
 
-(vkd3d spoofs the adapter *name* for game compatibility; the 12 GB VRAM is the
-real M5.) Apple's own D3DMetal is faster for D3D12, but it ships inside the Game
-Porting Toolkit on Wine 7.7, which is far too old to run today's Steam client —
-so it isn't usable as a Steam backend. For DX12 Steam games, use vkd3d; for DX11
-games, use DXMT.
+(D3DMetal presents itself as an AMD GPU; Unreal Engine may then warn about the
+"driver", which `r.WarnOfBadDrivers=0` in the game's Engine.ini silences.)
 
 ## Quick start
 
 ```sh
 cp env/.env.example env/.env      # settings: Family View PIN, benchmarks overlay, ...
-./macgames setup                  # Rosetta + Wine 11.21 + DXMT 0.80 + GPTK 3.0 (~500 MB)
-./macgames create main dxmt       # new bottle using DXMT
+./macgames setup                  # Rosetta, Wine 11.21, DXMT, GPTK 3.0, then builds CrossOver's Wine
+./macgames create main            # new bottle (CrossOver Wine + D3DMetal)
 ./macgames install-steam main     # Windows Steam, already updated
 ./macgames steam main             # log in, install your game
 ./macgames games main             # list installed games and app IDs
 ./macgames launch main            # just Steam (unlocks Family View when STEAM_PIN is set)
 ./macgames launch main 3404260    # start a game; applies games/3404260/game.conf
 SHOW_BENCHMARKS=true ./macgames launch main 3404260   # with the FPS/memory overlay
-METALFX=1 ./macgames launch main 3404260   # MetalFX upscaling (DXMT)
+METALFX=1 ./macgames launch main 3404260   # MetalFX upscaling (dxmt backend)
+./macgames switch main crossover  # move an existing bottle, Steam and games included
 RETINA=0 ./macgames steam main           # opt out of full Retina resolution
 ```
 
@@ -98,23 +103,25 @@ Rosetta hides AVX from x86 programs unless asked, and games built for AVX refuse
 
 ## Backends
 
-- `dxmt` (default): Wine 11.21 with DXMT swapped in for d3d11/dxgi/d3d10core. Best for D3D11 games; D3D12 still goes through vkd3d. Runs Steam.
+- `crossover` (default): CrossOver's Wine 11.0 with D3DMetal for D3D10/11/12. Runs Steam and DX12 games (feature level 12_1).
+- `dxmt`: Wine 11.21 with DXMT swapped in for d3d11/dxgi/d3d10core. Good for D3D11 games; D3D12 goes through vkd3d (feature level 11_0). Runs Steam.
 - `wined3d`: plain Wine 11.21. D3D9/10/11 → OpenGL (slower, most compatible), D3D12 → vkd3d. Runs Steam. Best for DX12 games, since DXMT's dxgi can get in vkd3d's way.
 - `d3dmetal`: Apple's Game Porting Toolkit (Wine 7.7) + D3DMetal. Fastest D3D12, but Wine 7.7 can't run the modern Steam client — use it only to launch a game's own `.exe` directly (`macgames run`).
 
-A bottle's backend is fixed when it's created. `dxmt` and `wined3d` share one Wine build; `d3dmetal` is a different, older one. Prefixes from different Wine builds shouldn't be mixed.
+`dxmt` and `wined3d` share one Wine build. `macgames switch <bottle> <backend>` moves a bottle to another backend in place: it clones the prefix to `prefix.bak-<old backend>` first (APFS clone, no extra disk) and updates it. Steam keeps its games but asks you to log in once, since it sees a new device.
 
 ## Commands
 
 ```
 setup                      download Rosetta, Wine, DXMT and GPTK runtimes
-create <bottle> [backend]  new bottle (dxmt | wined3d | d3dmetal)
+create <bottle> [backend]  new bottle (crossover | dxmt | wined3d | d3dmetal)
+switch <bottle> <backend>  move a bottle (Steam, games and all) to another backend
 list                       list bottles
 delete <bottle>            remove a bottle
 run <bottle> <exe> [args]  run a Windows program
 kill <bottle>              stop everything in a bottle
 doctor <bottle>            check the Direct3D 12 path works, no game needed
-install-steam <bottle>     install Windows Steam (dxmt/wined3d only)
+install-steam <bottle>     install Windows Steam (not d3dmetal)
 steam <bottle>             open Steam
 games <bottle>             list installed Steam games and app IDs
 launch <bottle> [appid]    start a Steam game (applies games/<appid>/game.conf); no appid: just Steam

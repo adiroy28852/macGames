@@ -22,6 +22,7 @@ DXMT_VER="v0.80"
 DXMT_URL="https://github.com/3Shain/dxmt/releases/download/$DXMT_VER/dxmt-$DXMT_VER-builtin.tar.gz"
 GPTK_VER="3.0-3"
 GPTK_URL="https://github.com/Gcenx/game-porting-toolkit/releases/download/Game-Porting-Toolkit-$GPTK_VER/game-porting-toolkit-$GPTK_VER.tar.xz"
+CX_VER="26.3.0"   # CrossOver's Wine, built from CodeWeavers' GPL source (tools/wine-crossover)
 STEAM_URL="https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe"
 
 STEAM_EXE='C:\Program Files (x86)\Steam\steam.exe'
@@ -50,9 +51,11 @@ load_env() {
 # ---------------------------------------------------------------- runtimes
 
 # Each backend maps to a Wine build and a Direct3D translation strategy:
+#   crossover — CrossOver's Wine 11.0 (built from source) with Apple's D3DMetal;
+#              D3D10/11/12 → Metal. Runs Steam and DX12 games. The default.
 #   wined3d  — Wine 11.21; D3D9/10/11 → OpenGL, D3D12 → vkd3d → Vulkan → Metal.
 #   dxmt     — Wine 11.21 with DXMT builtins; D3D10/11 → Metal (fast), and
-#              D3D12 still via Wine's vkd3d. Runs Steam. The default.
+#              D3D12 still via Wine's vkd3d. Runs Steam.
 #   d3dmetal — Apple Game Porting Toolkit (Wine 7.7) with D3DMetal; D3D11/12 →
 #              Metal. Wine 7.7 is too old for the modern Steam client (it
 #              crashes on launch), so this backend is only for running a game's
@@ -63,10 +66,11 @@ load_env() {
 # 11_0 (see tools/d3d12-probe); games needing 12_1-only features won't start.
 wine_bin_dir() {
   case "$1" in
+    crossover) echo "$DEPS/wine-crossover/bin" ;;
     wined3d)  echo "$DEPS/wine/Wine Staging.app/Contents/Resources/wine/bin" ;;
     dxmt)     echo "$DEPS/wine-dxmt/Wine Staging.app/Contents/Resources/wine/bin" ;;
     d3dmetal) echo "$DEPS/gptk/Game Porting Toolkit.app/Contents/Resources/wine/bin" ;;
-    *) die "unknown backend '$1' (wined3d|dxmt|d3dmetal)" ;;
+    *) die "unknown backend '$1' (crossover|wined3d|dxmt|d3dmetal)" ;;
   esac
 }
 
@@ -75,8 +79,8 @@ wine_exe() { # backend -> path to wine launcher (GPTK ships it as wine64)
   if [[ -x "$bin/wine" ]]; then echo "$bin/wine"; else echo "$bin/wine64"; fi
 }
 
-# Note: bottles made by one Wine build must not be opened by another, so the
-# backend is fixed when a bottle is created and never changed afterwards.
+# A bottle belongs to one Wine build at a time; `macgames switch` moves it to
+# another (keeping Steam and games) after cloning the prefix as a backup.
 
 fetch() { # url
   local f="$DL/$(basename "$1")"
@@ -122,8 +126,15 @@ cmd_setup() {
     mkdir -p "$DEPS/gptk" && tar -xf "$f" -C "$DEPS/gptk"
   fi
 
+  # Upstream Wine can't host D3DMetal on macOS any more; CrossOver's Wine can.
+  if [[ ! -x "$DEPS/wine-crossover/bin/wine" ]]; then
+    info "building CrossOver's Wine $CX_VER with D3DMetal (one-off, ~30 minutes)"
+    "$TOOLS/wine-crossover/build.sh" "$CX_VER" "$DEPS/wine/Wine Staging.app" \
+      "$DEPS/gptk/Game Porting Toolkit.app" "$DEPS/wine-crossover" "$DEPS/cx-build"
+  fi
+
   xattr -dr com.apple.quarantine "$DEPS" 2>/dev/null || true
-  info "dependencies ready: wine-staging $WINE_VER, dxmt $DXMT_VER, gptk $GPTK_VER"
+  info "dependencies ready: crossover wine $CX_VER, wine-staging $WINE_VER, dxmt $DXMT_VER, gptk $GPTK_VER"
 }
 
 # ---------------------------------------------------------------- bottles
@@ -144,10 +155,13 @@ wine_in() { # bottle backend cmd...
   local wine; wine="$(wine_exe "$backend")"
   [[ -x "$wine" ]] || die "runtime for '$backend' missing — run: macgames setup"
   export WINEDEBUG="${WINEDEBUG:--all}"
-  export WINEESYNC=1 WINEMSYNC=1
   cpu_env
   benchmarks_env
   case "$backend" in
+    # CrossOver's launcher normally sets these: ntdll registers every Windows
+    # module with libd3dshared, and games are told the GPU schedules in hardware.
+    crossover) export CX_APPLEGPTK_LIBD3DSHARED_PATH="$DEPS/wine-crossover/lib/external/libd3dshared.dylib" \
+                      CX_ACTIVE_GRAPHICS_BACKEND=d3dmetal ;;
     d3dmetal) export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}dxgi,d3d9,d3d10core,d3d11,d3d12=b" ;;
     # METALFX=1: render below native and let Apple's MetalFX upscale to the
     # Retina panel (DXMT's d3d11.metalSpatialUpscaleFactor sets the ratio).
@@ -170,7 +184,7 @@ benchmarks_env() {
 }
 
 cmd_create() { # name [backend]
-  local name="${1:?usage: macgames create <name> [wined3d|dxmt|d3dmetal]}" backend="${2:-dxmt}"
+  local name="${1:?usage: macgames create <name> [crossover|wined3d|dxmt|d3dmetal]}" backend="${2:-crossover}"
   wine_bin_dir "$backend" >/dev/null
   local dir; dir="$(bottle_dir "$name")"
   [[ -e "$dir" ]] && die "bottle '$name' already exists"
@@ -190,6 +204,30 @@ cmd_list() {
     local name; name="$(basename "$(dirname "$d")")"
     printf '%-20s %s\n' "$name" "$(grep BACKEND "$d")"
   done
+}
+
+cmd_switch() { # bottle backend
+  local bottle="${1:?usage: macgames switch <bottle> <backend>}" backend="${2:?missing backend}"
+  load_bottle "$bottle"
+  wine_bin_dir "$backend" >/dev/null
+  [[ -x "$(wine_exe "$backend")" ]] || die "runtime for '$backend' missing — run: macgames setup"
+  [[ "$BACKEND" == "$backend" ]] && { info "'$bottle' already uses $backend"; return; }
+  local dir; dir="$(bottle_dir "$bottle")"
+  info "stopping everything in '$bottle'"
+  "$(wine_bin_dir "$BACKEND")/wineserver" -k 2>/dev/null || true
+  "$(wine_bin_dir "$BACKEND")/wineserver" -w 2>/dev/null || true
+  local backup="$dir/prefix.bak-$BACKEND"
+  if [[ ! -e "$backup" ]]; then
+    info "backing up the prefix to $(basename "$backup") (APFS clone, ~0 extra disk)"
+    cp -cR "$WINEPREFIX" "$backup"
+  fi
+  info "updating '$bottle' for $backend"
+  WINEDEBUG=-all "$(wine_exe "$backend")" wineboot -u >/dev/null 2>&1
+  # The update starts Wine's desktop, which launches startup items such as Steam.
+  "$(wine_bin_dir "$backend")/wineserver" -k 2>/dev/null || true
+  sed -i '' "s/^BACKEND=.*/BACKEND=$backend/" "$dir/bottle.conf"
+  rm -f "$(steam_session_file "$bottle")"
+  info "'$bottle' now uses $backend (undo: macgames switch $bottle $BACKEND, or restore $(basename "$backup"))"
 }
 
 cmd_delete() {
@@ -507,7 +545,8 @@ usage() {
 macgames — Windows games on Apple Silicon
 
   setup                          download Wine, DXMT and Game Porting Toolkit runtimes
-  create <bottle> [backend]      new Wine prefix; backend: dxmt (default) | wined3d | d3dmetal
+  create <bottle> [backend]      new Wine prefix; backend: crossover (default) | dxmt | wined3d | d3dmetal
+  switch <bottle> <backend>      move a bottle (Steam, games and all) to another backend
   list                           list bottles
   delete <bottle>                remove a bottle
   run <bottle> <exe> [args]      run a Windows program
@@ -532,12 +571,16 @@ EOF
 # Wrapped in main so bash parses the whole file before running anything.
 main() {
   load_env
+  # Every Wine process in a session must agree on these: CrossOver's Wine refuses
+  # to join a wineserver started with msync ("please enable WINEMSYNC").
+  export WINEESYNC=1 WINEMSYNC=1
   cmd="${1:-help}"; shift || true
   case "$cmd" in
     setup) cmd_setup "$@" ;;
     create) cmd_create "$@" ;;
     list) cmd_list ;;
     delete) cmd_delete "$@" ;;
+    switch) cmd_switch "$@" ;;
     run) cmd_run "$@" ;;
     kill) cmd_kill "$@" ;;
     doctor) cmd_doctor "$@" ;;

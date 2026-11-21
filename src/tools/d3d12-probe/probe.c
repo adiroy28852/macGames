@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);  /* D3DMetal can end the process before stdio flushes */
     IDXGIFactory4 *factory = NULL;
     HRESULT hr = CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory);
     printf("CreateDXGIFactory1: 0x%08lx\n", (unsigned long)hr);
